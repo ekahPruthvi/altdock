@@ -3,6 +3,7 @@ use gtk4::gio::File;
 use gtk4::glib;
 use gtk4::{Application, Box as GtkBox, CssProvider, Label, Orientation, prelude::*};
 use gtk4_layer_shell::LayerShell;
+use niri_ipc::{socket::Socket, Action, Request};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -33,7 +34,6 @@ fn load_css() {
 
 const PROBE_PATH: &str = "/var/lib/cynager/info.probe";
 
-/// Reads `shellout: <connector>` from the :set section of info.probe.
 fn read_shellout(path: &str) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     let set_start = content.find(":set")?;
@@ -62,6 +62,24 @@ fn pinned_monitor() -> Option<gtk4::gdk::Monitor> {
         .find(|m| m.connector().map(|c| c == connector.as_str()).unwrap_or(false))
 }
 
+fn niri_switch_workspace(down: bool) {
+    std::thread::spawn(move || {
+        let action = if down {
+            Action::FocusWorkspaceDown {}
+        } else {
+            Action::FocusWorkspaceUp {}
+        };
+        match Socket::connect() {
+            Ok(mut sock) => {
+                if let Err(e) = sock.send(Request::Action(action)) {
+                    eprintln!("niri ipc send failed: {e}");
+                }
+            }
+            Err(e) => eprintln!("niri ipc connect failed: {e}"),
+        }
+    });
+}
+
 fn activate(app: &Application) {
     load_css();
 
@@ -74,6 +92,25 @@ fn activate(app: &Application) {
         .build();
     dockbox.add_css_class("dockBox");
     let dockbox_anim = dockbox.clone();
+
+    let scroll = gtk4::EventControllerScroll::new(
+        gtk4::EventControllerScrollFlags::VERTICAL,
+    );
+    let acc: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+    scroll.connect_scroll(move |_, _, dy| {
+        let total = acc.get() + dy;
+        if total >= 1.0 {
+            acc.set(0.0);
+            niri_switch_workspace(true);
+        } else if total <= -1.0 {
+            acc.set(0.0);
+            niri_switch_workspace(false);
+        } else {
+            acc.set(total);
+        }
+        glib::Propagation::Stop
+    });
+    dockbox_anim.add_controller(scroll);
 
     let dockerhover = GtkBox::new(Orientation::Horizontal, 0);
     dockerhover.set_size_request(200, 5);
@@ -96,7 +133,6 @@ fn activate(app: &Application) {
         dock_win.set_monitor(Some(&m));
     }
 
-    // Hover strip at the top edge reveals the dock after a short delay.
     let hover_ctrl = gtk4::EventControllerMotion::new();
     let pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
