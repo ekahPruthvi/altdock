@@ -7,6 +7,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
+use self_update::cargo_crate_version;
+
 mod altdock;
 use altdock::spawn_altdock;
 
@@ -31,6 +33,7 @@ fn load_css() {
 
 const PROBE_PATH: &str = "/var/lib/cynager/info.probe";
 
+/// Reads `shellout: <connector>` from the :set section of info.probe.
 fn read_shellout(path: &str) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     let set_start = content.find(":set")?;
@@ -116,6 +119,87 @@ fn activate(app: &Application) {
     dockerhover.add_controller(hover_ctrl);
 }
 
+struct UpdateOutcome {
+    updated: bool,
+    version: String,
+}
+
+const ALTDOCK_BIN_PATH: &str = "/usr/bin/altdock";
+
+fn ensure_writable(path: &str) -> Result<(), String> {
+    use std::ffi::CString;
+
+    let c_path = CString::new(path).map_err(|e| e.to_string())?;
+
+    let path_obj = std::path::Path::new(path);
+    if path_obj.exists() {
+        let writable = unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 };
+        if !writable {
+            return Err(format!(
+                "no write permission for '{}'. Try: sudo altdock --update",
+                path
+            ));
+        }
+    }
+
+    if let Some(parent) = path_obj.parent() {
+        let c_parent = CString::new(parent.to_string_lossy().to_string())
+            .map_err(|e| e.to_string())?;
+        let dir_writable = unsafe { libc::access(c_parent.as_ptr(), libc::W_OK) == 0 };
+        if !dir_writable {
+            return Err(format!(
+                "no write permission for directory '{}'. Try: sudo altdock --update",
+                parent.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn check_for_updates() -> Result<UpdateOutcome, Box<dyn std::error::Error>> {
+    let status = self_update::backends::github::Update::configure()
+        .repo_owner("ekahPruthvi")
+        .repo_name("altdock")
+        .bin_name("altdock")
+        .target("x86_64")
+        .bin_install_path(ALTDOCK_BIN_PATH)
+        .show_download_progress(true)
+        .no_confirm(true)
+        .current_version(cargo_crate_version!())
+        .build()?
+        .update()?;
+
+    Ok(UpdateOutcome {
+        updated: status.is_updated(),
+        version: status.version().to_string(),
+    })
+}
+
+fn run_update() -> i32 {
+    println!("Checking for updates...");
+
+    if let Err(msg) = ensure_writable(ALTDOCK_BIN_PATH) {
+        eprintln!("Cannot update altdock: {}", msg);
+        return 1;
+    }
+
+    match check_for_updates() {
+        Ok(outcome) => {
+            if outcome.updated {
+                println!("altdock updated to version {}", outcome.version);
+            } else {
+                println!("altdock is already up to date ({})", outcome.version);
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("Update failed: {}", e);
+            1
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -123,6 +207,7 @@ fn main() {
             println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
             std::process::exit(0);
         }
+        Some("--update") | Some("-U") => std::process::exit(run_update()),
         Some("--snapped") | Some("-f") => std::process::exit(altdock::cli_list_snapped()),
         Some("--unsnap") | Some("-u") => match args.get(2) {
             Some(name) => std::process::exit(altdock::cli_unsnap(name)),
@@ -134,6 +219,7 @@ fn main() {
         Some("--help") | Some("-H") => {
             println!("usage: altdock [option]");
             println!("  -V, --version        print version");
+            println!("  -U, --update         self-update");
             println!("  -f, --snapped        list snapped (tiled) apps");
             println!("  -u, --unsnap <app>   unsnap an app, restoring its size and position");
             std::process::exit(0);
