@@ -2,7 +2,7 @@ use gtk4::gdk;
 use gtk4::glib;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Button, DragSource,
-    GestureClick, Image, Popover, Separator, prelude::*,
+    GestureClick, Image, Separator, prelude::*,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use std::cell::{Cell, RefCell};
@@ -967,6 +967,7 @@ struct TrayMenuLayer {
     container: GtkBox,
     open_address: RefCell<Option<String>>,
     popover: RefCell<Option<GtkBox>>,
+    anchor: RefCell<Option<Button>>,
 }
 
 impl TrayMenuLayer {
@@ -977,6 +978,7 @@ impl TrayMenuLayer {
             container,
             open_address: RefCell::new(None),
             popover: RefCell::new(None),
+            anchor: RefCell::new(None),
         })
     }
 
@@ -985,6 +987,9 @@ impl TrayMenuLayer {
             self.container.remove(&child);
         }
         *self.open_address.borrow_mut() = None;
+        if let Some(anchor) = self.anchor.borrow_mut().take() {
+            anchor.set_visible(true);
+        }
         let popover = self.popover.borrow_mut().take();
         if let Some(pop) = popover {
             if let Some(parent) = pop.parent().and_then(|p| p.downcast::<GtkBox>().ok()) {
@@ -1008,11 +1013,10 @@ fn build_menu_box(
     menu_path: &str,
     cmd_tx: &TrayCmdSender,
     layer: &Rc<TrayMenuLayer>,
+    stack: &gtk4::Stack,
+    page_name: &str,
 ) -> GtkBox {
     let menu_box = GtkBox::new(gtk4::Orientation::Vertical, 0);
-    menu_box.set_halign(gtk4::Align::End);
-    menu_box.set_hexpand(true);
-    menu_box.add_css_class("trayMenuBox");
 
     for item in items {
         if !item.visible {
@@ -1041,13 +1045,34 @@ fn build_menu_box(
                 label_text.push(c);
             }
         }
-        if item.toggle_state == TrayToggleState::On {
+        let has_submenu = !item.submenu.is_empty();
+        let clean_label = label_text.clone();
+        let is_toggleable = !matches!(
+            item.toggle_type,
+            system_tray::menu::ToggleType::CannotBeToggled
+        );
+        if has_submenu || !is_toggleable {
+        } else if item.toggle_state == TrayToggleState::On {
+            label_text = format!("• {label_text}");
+        } else {
             label_text = format!("{label_text}");
         }
 
-        let label = gtk4::Label::builder().label(&label_text).xalign(0.0).build();
+        let label = gtk4::Label::builder()
+            .label(&label_text)
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
         let row = Button::builder().css_classes(["trayMenuItem"]).build();
-        row.set_child(Some(&label));
+        if has_submenu {
+            let content = GtkBox::new(gtk4::Orientation::Horizontal, 12);
+            content.append(&label);
+            let arrow = gtk4::Label::builder().label("›").xalign(1.0).build();
+            content.append(&arrow);
+            row.set_child(Some(&content));
+        } else {
+            row.set_child(Some(&label));
+        }
         row.set_sensitive(item.enabled);
 
         if !item.submenu.is_empty() {
@@ -1057,29 +1082,87 @@ fn build_menu_box(
             let cmd_tx = cmd_tx.clone();
             let layer = layer.clone();
             let item_id = item.id;
+            let stack_weak = stack.downgrade();
+            let parent_page = page_name.to_string();
+            let sub_title = clean_label.clone();
 
-            row.connect_clicked(move |btn| {
+            row.connect_clicked(move |_| {
+                let Some(stack) = stack_weak.upgrade() else {
+                    return;
+                };
                 let _ = cmd_tx.send(TrayCommand::AboutToShow {
                     address: address.clone(),
                     menu_path: menu_path.clone(),
                     id: item_id,
                 });
 
-                let submenu_box = build_menu_box(
-                    &submenu_items,
-                    &address,
-                    &menu_path,
-                    &cmd_tx,
-                    &layer,
-                );
+                let sub_page_name = format!("{parent_page}/{item_id}");
+                if stack.child_by_name(&sub_page_name).is_none() {
+                    let sub_page = build_menu_box(
+                        &submenu_items,
+                        &address,
+                        &menu_path,
+                        &cmd_tx,
+                        &layer,
+                        &stack,
+                        &sub_page_name,
+                    );
 
-                let child_popover = Popover::builder()
-                    .child(&submenu_box)
-                    .position(gtk4::PositionType::Right)
-                    .has_arrow(true)
-                    .build();
-                child_popover.set_parent(btn);
-                child_popover.popup();
+                    let back_content = GtkBox::new(gtk4::Orientation::Horizontal, 8);
+                    back_content.append(&gtk4::Label::new(Some("‹")));
+                    back_content.append(
+                        &gtk4::Label::builder()
+                            .use_markup(true)
+                            .label(format!("<b>{}</b>", glib::markup_escape_text(&sub_title)))
+                            .xalign(0.0)
+                            .hexpand(true)
+                            .ellipsize(gtk4::pango::EllipsizeMode::End)
+                            .build(),
+                    );
+                    let back_btn = Button::builder()
+                        .css_classes(["trayMenuItem", "trayMenuBack"])
+                        .child(&back_content)
+                        .build();
+                    {
+                        let stack_weak = stack.downgrade();
+                        let parent_page = parent_page.clone();
+                        let sub_page_name = sub_page_name.clone();
+                        back_btn.connect_clicked(move |_| {
+                            let Some(stack) = stack_weak.upgrade() else {
+                                return;
+                            };
+                            stack.set_visible_child_full(
+                                &parent_page,
+                                gtk4::StackTransitionType::SlideRight,
+                            );
+                            let stack_weak = stack.downgrade();
+                            let sub_page_name = sub_page_name.clone();
+                            glib::timeout_add_local_once(Duration::from_millis(300), move || {
+                                if let Some(stack) = stack_weak.upgrade() {
+                                    if stack.visible_child_name().as_deref()
+                                        != Some(sub_page_name.as_str())
+                                    {
+                                        if let Some(page) = stack.child_by_name(&sub_page_name) {
+                                            stack.remove(&page);
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                    }
+                    let back_sep = Separator::new(gtk4::Orientation::Horizontal);
+                    back_sep.add_css_class("trayMenuSeparator");
+                    back_sep.set_margin_start(10);
+                    back_sep.set_margin_end(10);
+                    sub_page.prepend(&back_sep);
+                    sub_page.prepend(&back_btn);
+
+                    stack.add_named(&sub_page, Some(&sub_page_name));
+                }
+                stack.set_visible_child_full(
+                    &sub_page_name,
+                    gtk4::StackTransitionType::SlideLeft,
+                );
             });
         } else {
             let address = address.to_string();
@@ -1131,7 +1214,54 @@ fn show_tray_menu(
         .css_classes(["trayMenuPopover"])
         .build();
 
-    let menu_box = build_menu_box(&menu.submenus, address, menu_path, cmd_tx, layer);
+    let stack = gtk4::Stack::builder()
+        .transition_type(gtk4::StackTransitionType::SlideLeftRight)
+        .transition_duration(200)
+        .hhomogeneous(false)
+        .vhomogeneous(false)
+        .interpolate_size(true)
+        .build();
+    let root_page = build_menu_box(
+        &menu.submenus,
+        address,
+        menu_path,
+        cmd_tx,
+        layer,
+        &stack,
+        "root",
+    );
+
+    let title = anchor
+        .tooltip_text()
+        .map(|t| t.to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| address.to_string());
+    let title_label = gtk4::Label::builder()
+        .use_markup(true)
+        .label(format!("<b>{}</b>", glib::markup_escape_text(&title)))
+        .xalign(0.0)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .css_classes(["trayMenuTitle"])
+        .build();
+    title_label.set_margin_start(10);
+    title_label.set_margin_end(10);
+    title_label.set_margin_top(6);
+    title_label.set_margin_bottom(6);
+    let title_sep = Separator::new(gtk4::Orientation::Horizontal);
+    title_sep.add_css_class("trayMenuSeparator");
+    title_sep.set_margin_start(10);
+    title_sep.set_margin_end(10);
+    root_page.prepend(&title_sep);
+    root_page.prepend(&title_label);
+
+    stack.add_named(&root_page, Some("root"));
+    stack.set_visible_child_name("root");
+
+    let menu_box = GtkBox::new(gtk4::Orientation::Vertical, 0);
+    menu_box.set_halign(gtk4::Align::End);
+    menu_box.set_hexpand(true);
+    menu_box.add_css_class("trayMenuBox");
+    menu_box.append(&stack);
 
     let close_gesture = GestureClick::new();
     close_gesture.set_button(gdk::BUTTON_SECONDARY);
@@ -1152,6 +1282,8 @@ fn show_tray_menu(
         Some(tray_box) => tray_box.insert_child_after(&popover, Some(anchor)),
         None => layer.container.append(&popover),
     }
+    anchor.set_visible(false);
+    *layer.anchor.borrow_mut() = Some(anchor.clone());
     *layer.popover.borrow_mut() = Some(popover);
     *layer.open_address.borrow_mut() = Some(address.to_string());
 }
