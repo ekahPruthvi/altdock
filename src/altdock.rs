@@ -45,7 +45,7 @@ fn signal_capsule() {
         }
     }
     for _ in 0..20 {
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(300));
         if capsule_state().as_deref() != Some("desktop") {
             break;
         }
@@ -171,25 +171,7 @@ fn get_niri_windows_map() -> HashMap<u64, NiriWindow> {
     map
 }
 
-fn is_minimized(id: u64) -> bool {
-    Command::new("cos-ssd")
-        .arg("-C")
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout).lines().any(|l| {
-                l.split_whitespace()
-                    .next()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    == Some(id)
-            })
-        })
-        .unwrap_or(false)
-}
-
 fn focus_window(id: u64) {
-    if is_minimized(id) {
-        let _ = Command::new("cos-ssd").args(["-m", &id.to_string()]).status();
-    }
     let _ = Command::new("niri")
         .args(["msg", "action", "focus-window", "--id", &id.to_string()])
         .spawn();
@@ -237,7 +219,6 @@ fn send_action(action: Action) {
 
 thread_local! {
     static DRAGGED_WINDOW: Cell<Option<u64>> = const { Cell::new(None) };
-    static DESKTOP_SHOWN_BY_DRAG: Cell<bool> = const { Cell::new(false) };
     static FOCUS_SHARED: RefCell<std::collections::HashSet<u64>> =
         RefCell::new(std::collections::HashSet::new());
 }
@@ -375,15 +356,6 @@ fn snap_focus_ids() -> Vec<u64> {
         .filter(|(_, r)| r.focus_mode)
         .map(|(id, _)| id)
         .collect()
-}
-
-fn toggle_show_desktop() {
-    if let Err(e) = std::process::Command::new("pkill")
-        .args(["-USR1", "capsule"])
-        .spawn()
-    {
-        eprintln!("[altdock] Failed to toggle show-desktop: {}", e);
-    }
 }
 
 fn move_column_to(id: u64, index: usize) {
@@ -681,6 +653,13 @@ fn focus_window_animated(id: u64) {
 }
 
 fn focus_window_animated_from(orig: Option<u64>, id: u64) {
+    
+    if desktop_needs_show() {
+        signal_capsule();
+        focus_window(id);
+        return;
+    }
+
     let Some(orig_id) = orig else {
         focus_window(id);
         return;
@@ -691,9 +670,6 @@ fn focus_window_animated_from(orig: Option<u64>, id: u64) {
         return;
     }
 
-    if desktop_needs_show() {
-        signal_capsule();
-    }
     nudge_window(orig_id, 300.0, || {});
     nudge_window(id, -300.0, move || {
         focus_window(id);
@@ -1972,6 +1948,7 @@ fn make_dock_btn(win: &NiriWindow) -> Button {
     if win.is_focused {
         btn.add_css_class("dockBtnActive");
     }
+    btn.set_cursor_from_name(Some("default"));
 
     let id = win.id;
     let hover_ctrl = gtk4::EventControllerMotion::new();
@@ -2021,6 +1998,14 @@ fn make_dock_btn(win: &NiriWindow) -> Button {
         }
         last_click.set(Some(now));
 
+        if desktop_needs_show() {
+            glib::timeout_add_local_once(Duration::from_millis(150), move || {
+                signal_capsule();
+                focus_window(id);
+            });
+            return;
+        }
+
         focus_window_animated(id);
     });
 
@@ -2032,6 +2017,9 @@ fn make_dock_btn(win: &NiriWindow) -> Button {
                 let dragged = DRAGGED_WINDOW.with(|d| d.get());
                 if dragged.is_some() && dragged != Some(id) {
                     b.add_css_class("dockBtnHint");
+                    if b.has_css_class("dockBtnTiled"){
+                        b.set_halign(gtk4::Align::Fill);
+                    }
                 }
             }
         });
@@ -2047,7 +2035,7 @@ fn make_dock_btn(win: &NiriWindow) -> Button {
     btn.add_controller(hint_ctrl);
 
     let drop_btn = btn.downgrade();
-    let drop_target = gtk4::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+    let drop_target = gtk4::DropTarget::new(u64::static_type(), gdk::DragAction::MOVE);
     drop_target.connect_drop(move |_, _, _, _| {
         if let Some(b) = drop_btn.upgrade() {
             b.remove_css_class("dockBtnHint");
@@ -2057,9 +2045,6 @@ fn make_dock_btn(win: &NiriWindow) -> Button {
         };
         if dragged == id {
             return false;
-        }
-        if DESKTOP_SHOWN_BY_DRAG.with(|d| d.take()) {
-            toggle_show_desktop();
         }
         tile_pair_in_new_workspace(id, dragged);
         true
@@ -2084,37 +2069,61 @@ fn make_dock_btn(win: &NiriWindow) -> Button {
     btn.add_controller(menu_gesture);
 
     {
-        let desktop_path = desktop_for_app_id(&win.app_id);
         let drag_source = DragSource::new();
-        drag_source.set_actions(gdk::DragAction::COPY);
+        drag_source.set_actions(gdk::DragAction::MOVE);
 
         drag_source.connect_prepare(move |_src, _x, _y| {
-            let payload = match &desktop_path {
-                Some(path) => format!("{}\r\n", glib::filename_to_uri(path, None).ok()?),
-                None => "\r\n".to_string(),
-            };
-            let bytes = glib::Bytes::from_owned(payload.into_bytes());
-            Some(gdk::ContentProvider::for_bytes("text/uri-list", &bytes))
+            Some(gdk::ContentProvider::for_value(&id.to_value()))
         });
 
-        let drag_icon = icon.clone();
+        let drag_icon = icon.downgrade();
+        let drag_icon_name = icon_name.clone();
 
         if let Some(settings) = gtk4::Settings::default() {
             settings.set_gtk_dnd_drag_threshold(24);
         }
 
+        let end_icon = icon.downgrade();
+        let end_btn = btn.downgrade();
         drag_source.connect_drag_end(move |_, _, _| {
+            if let Some(i) = end_icon.upgrade() {
+                i.set_opacity(1.0);
+            }
+            if let Some(b) = end_btn.upgrade() {
+                b.set_cursor_from_name(Some("default"));
+            }
             glib::idle_add_local_once(|| {
                 DRAGGED_WINDOW.with(|d| d.set(None));
-                DESKTOP_SHOWN_BY_DRAG.with(|d| d.set(false));
             });
         });
 
+        let begin_btn = btn.downgrade();
         drag_source.connect_drag_begin(move |src, _drag| {
             DRAGGED_WINDOW.with(|d| d.set(Some(id)));
-            if let Some(paintable) = drag_icon.paintable() {
-                src.set_icon(Some(&paintable), 0, 0);
+            if let Some(b) = begin_btn.upgrade() {
+                b.set_cursor_from_name(Some("none"));
             }
+            let Some(img) = drag_icon.upgrade() else {
+                return;
+            };
+            let theme = gtk4::IconTheme::for_display(&img.display());
+            let scale = img.scale_factor();
+            let size = 62;
+            let name = if theme.has_icon(&drag_icon_name) {
+                drag_icon_name.as_str()
+            } else {
+                "application-x-executable"
+            };
+            let paintable = theme.lookup_icon(
+                name,
+                &[],
+                size,
+                scale,
+                gtk4::TextDirection::None,
+                gtk4::IconLookupFlags::empty(),
+            );
+            src.set_icon(Some(&paintable), size / 2, size / 2);
+            img.set_opacity(0.4);
         });
 
         icon.add_controller(drag_source);
@@ -2693,30 +2702,6 @@ pub fn spawn_altdock(app: &Application, dockbox: GtkBox) -> ApplicationWindow {
         });
     }
     win.add_controller(key_ctrl);
-
-    let drag_motion = gtk4::DropControllerMotion::new();
-    drag_motion.connect_leave(|_| {
-        if DRAGGED_WINDOW.with(|d| d.get()).is_none() {
-            return;
-        }
-        glib::timeout_add_local_once(Duration::from_millis(80), || {
-            if DRAGGED_WINDOW.with(|d| d.get()).is_some()
-                && !DESKTOP_SHOWN_BY_DRAG.with(|d| d.get())
-                && !desktop_needs_show()
-            {
-                DESKTOP_SHOWN_BY_DRAG.with(|d| d.set(true));
-                toggle_show_desktop();
-            }
-        });
-    });
-    drag_motion.connect_enter(|_, _, _| {
-        if DRAGGED_WINDOW.with(|d| d.get()).is_some()
-            && DESKTOP_SHOWN_BY_DRAG.with(|d| d.take())
-        {
-            toggle_show_desktop();
-        }
-    });
-    win.add_controller(drag_motion);
 
     DOCK_WINDOW.with(|w| *w.borrow_mut() = Some(win.clone()));
 
