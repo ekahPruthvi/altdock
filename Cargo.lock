@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "altdock"
-version = "1.2.21"
+version = "1.2.22"
 dependencies = [
  "gdk4",
  "gtk4",

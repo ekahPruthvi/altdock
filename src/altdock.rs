@@ -1619,6 +1619,50 @@ fn snap_to_focus_mode(id: u64) {
     send_action(Action::FocusWindow { id });
 }
 
+fn focus_width_is_full(id: u64) -> Option<bool> {
+    if !snap_is_focus_mode(id) {
+        return None;
+    }
+    let mut sock = Socket::connect().ok()?;
+    let windows = match sock.send(Request::Windows) {
+        Ok(Ok(Response::Windows(w))) => w,
+        _ => return None,
+    };
+    let workspaces = match sock.send(Request::Workspaces) {
+        Ok(Ok(Response::Workspaces(w))) => w,
+        _ => return None,
+    };
+    let outputs = match sock.send(Request::Outputs) {
+        Ok(Ok(Response::Outputs(o))) => o,
+        _ => return None,
+    };
+    let win = windows.iter().find(|w| w.id == id)?;
+    if win.is_floating {
+        return None;
+    }
+    let ws = workspaces.iter().find(|ws| Some(ws.id) == win.workspace_id)?;
+    let out_w = outputs.get(ws.output.as_ref()?)?.logical.as_ref()?.width as f64;
+    if out_w <= 0.0 {
+        return None;
+    }
+    let ratio = win.layout.window_size.0 as f64 / out_w;
+    Some(ratio >= 0.75)
+}
+
+fn snap_focus_set_width(id: u64, proportion: f64) {
+    if proportion < 100.0 {
+        FOCUS_SHARED.with(|f| f.borrow_mut().remove(&id));
+    }
+    send_action_checked(
+        "set-window-width",
+        Action::SetWindowWidth {
+            id: Some(id),
+            change: SizeChange::SetProportion(proportion),
+        },
+    );
+    send_action(Action::FocusWindow { id });
+}
+
 fn is_alone_on_workspace_live(id: u64) -> bool {
     let Ok(mut sock) = Socket::connect() else {
         return false;
@@ -1898,13 +1942,26 @@ fn show_dock_menu(anchor: &Button, id: u64, app_id: &str) {
         }));
     }
     if is_window_tiled(id) {
-        menu_box.append(&make_menu_item("Remove from Snap", true, move || {
+        menu_box.append(&make_menu_item("Remove from focus", true, move || {
             remove_from_tiling(id)
         }));
     } else {
-        menu_box.append(&make_menu_item("Snap to Focus Mode", true, move || {
+        menu_box.append(&make_menu_item("Snap to Focus", true, move || {
             snap_to_focus_mode(id)
         }));
+    }
+    match focus_width_is_full(id) {
+        Some(true) => {
+            menu_box.append(&make_menu_item("Snap to Half focus", true, move || {
+                snap_focus_set_width(id, 50.0)
+            }));
+        }
+        Some(false) => {
+            menu_box.append(&make_menu_item("Snap to Full focus", true, move || {
+                snap_focus_set_width(id, 100.0)
+            }));
+        }
+        None => {}
     }
     menu_box.append(&make_menu_item("Quit Application", true, move || {
         force_quit_window(id);
