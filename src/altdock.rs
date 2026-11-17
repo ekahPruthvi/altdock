@@ -395,6 +395,8 @@ fn tile_pair_in_new_workspace(target: u64, dragged: u64) {
             wd.layout.pos_in_scrolling_layout,
         ) {
             if t_col != d_col {
+                snap_put(wt.id, SnapRecord::capture(wt, true), true);
+                snap_put(wd.id, SnapRecord::capture(wd, true), true);
                 move_column_to(dragged, t_col);
             }
             return;
@@ -420,6 +422,9 @@ fn tile_pair_in_new_workspace(target: u64, dragged: u64) {
             .workspace_id
             .and_then(|id| workspaces.iter().find(|ws| ws.id == id));
         if let Some(ws) = anchor_ws {
+            snap_put(anchor.id, SnapRecord::capture(anchor, true), true);
+            snap_put(mover.id, SnapRecord::capture(mover, true), true);
+
             if mover.workspace_id != anchor.workspace_id {
                 snap_put(mover.id, SnapRecord::capture(mover, false), false);
                 send_action_checked(
@@ -2293,6 +2298,102 @@ fn record_focus(windows: &[NiriWindow]) {
     });
 }
 
+fn move_focus_snaps_after_new_window(new_id: u64) {
+    let Ok(mut sock) = Socket::connect() else {
+        return;
+    };
+
+    let windows = match sock.send(Request::Windows) {
+        Ok(Ok(Response::Windows(windows))) => windows,
+        _ => return,
+    };
+    let workspaces = match sock.send(Request::Workspaces) {
+        Ok(Ok(Response::Workspaces(workspaces))) => workspaces,
+        _ => return,
+    };
+
+    let Some(new_window) = windows.iter().find(|w| w.id == new_id) else {
+        return;
+    };
+    let Some(current_ws_id) = new_window.workspace_id else {
+        return;
+    };
+    let Some(current_ws) = workspaces.iter().find(|ws| ws.id == current_ws_id) else {
+        return;
+    };
+
+    let focus_snaps: Vec<u64> = snap_load()
+        .into_iter()
+        .filter(|(id, record)| {
+            *id != new_id
+                && record.focus_mode
+                && windows.iter().any(|w| {
+                    w.id == *id
+                        && w.workspace_id == Some(current_ws_id)
+                        && !w.is_floating
+                })
+        })
+        .map(|(id, _)| id)
+        .collect();
+
+    if focus_snaps.is_empty() {
+        return;
+    }
+
+    if let Some(new_app) = new_window.app_id.as_deref().filter(|a| !a.is_empty()) {
+        let same_app = focus_snaps.iter().any(|sid| {
+            windows
+                .iter()
+                .find(|w| w.id == *sid)
+                .and_then(|w| w.app_id.as_deref())
+                .map(|a| a.eq_ignore_ascii_case(new_app))
+                .unwrap_or(false)
+        });
+        if same_app {
+            eprintln!(
+                "[altdock] new window {new_id} belongs to the focused app ({new_app}), not moving focus snaps"
+            );
+            return;
+        }
+    }
+
+    let other_ws_has_floating = windows.iter().any(|w| {
+        w.is_floating
+            && w.workspace_id != Some(current_ws_id)
+            && w.workspace_id
+                .and_then(|wid| workspaces.iter().find(|ws| ws.id == wid))
+                .map(|ws| ws.output == current_ws.output)
+                .unwrap_or(false)
+    });
+    if other_ws_has_floating {
+        eprintln!(
+            "[altdock] new window {new_id}: not moving focus snaps, another workspace on {:?} has floating windows",
+            current_ws.output
+        );
+        return;
+    }
+
+    let Some(next_ws) = workspaces
+        .iter()
+        .find(|ws| ws.output == current_ws.output && ws.idx == current_ws.idx + 1)
+    else {
+        eprintln!(
+            "[altdock] cannot move focus snaps: no workspace after idx {} on output {:?}",
+            current_ws.idx, current_ws.output
+        );
+        return;
+    };
+
+    eprintln!(
+        "[altdock] new window {new_id}: moving focus-snapped windows {:?} from workspace {} to {}",
+        focus_snaps, current_ws.id, next_ws.id
+    );
+
+    for id in focus_snaps {
+        move_window_to_ws(id, next_ws.id, next_ws.idx);
+    }
+}
+
 fn switcher_order(dock_order: &[u64], orig: Option<u64>) -> Vec<u64> {
     let mut out: Vec<u64> = Vec::new();
     if let Some(o) = orig {
@@ -2520,6 +2621,8 @@ pub fn spawn_altdock(app: &Application, dockbox: GtkBox) -> ApplicationWindow {
 
     let initial = windows_sorted(&get_niri_windows_map());
     record_focus(&initial);
+    let known_window_ids: Rc<RefCell<std::collections::HashSet<u64>>> =
+        Rc::new(RefCell::new(initial.iter().map(|w| w.id).collect()));
     update_dockbox(
         &dockbox_rc,
         &tray_box,
@@ -2536,6 +2639,7 @@ pub fn spawn_altdock(app: &Application, dockbox: GtkBox) -> ApplicationWindow {
         let tray_menu_layer = tray_menu_layer.clone();
         let niri_rx = niri_rx.clone();
         let dock_state = dock_state.clone();
+        let known_window_ids = known_window_ids.clone();
 
         glib::timeout_add_local(Duration::from_millis(150), move || {
             let rx = niri_rx.borrow();
@@ -2546,6 +2650,26 @@ pub fn spawn_altdock(app: &Application, dockbox: GtkBox) -> ApplicationWindow {
             drop(rx);
 
             if let Some(windows) = latest {
+                let current_ids: std::collections::HashSet<u64> =
+                    windows.iter().map(|w| w.id).collect();
+                let newly_opened: Vec<u64> = {
+                    let known = known_window_ids.borrow();
+                    windows
+                        .iter()
+                        .filter(|w| !known.contains(&w.id))
+                        .map(|w| w.id)
+                        .collect()
+                };
+                {
+                    let mut known = known_window_ids.borrow_mut();
+                    known.retain(|id| current_ids.contains(id));
+                    known.extend(current_ids.iter().copied());
+                }
+
+                for id in newly_opened {
+                    move_focus_snaps_after_new_window(id);
+                }
+
                 record_focus(&windows);
                 update_dockbox(
                     &dockbox_rc,
