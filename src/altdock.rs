@@ -321,6 +321,17 @@ fn snap_put(id: u64, rec: SnapRecord, overwrite: bool) {
     }
 }
 
+fn snap_put_focus_keep_origin(w: &niri_ipc::Window) {
+    let mut map = snap_load();
+    match map.get_mut(&w.id) {
+        Some(rec) => rec.focus_mode = true,
+        None => {
+            map.insert(w.id, SnapRecord::capture(w, true));
+        }
+    }
+    snap_save(&map);
+}
+
 fn snap_take(id: u64) -> Option<SnapRecord> {
     let mut map = snap_load();
     let rec = map.remove(&id);
@@ -330,6 +341,7 @@ fn snap_take(id: u64) -> Option<SnapRecord> {
     rec
 }
 
+#[allow(dead_code)]
 fn snap_take_split(id: u64) -> Option<SnapRecord> {
     let mut map = snap_load();
     if map.get(&id).map(|r| !r.focus_mode).unwrap_or(false) {
@@ -395,8 +407,8 @@ fn tile_pair_in_new_workspace(target: u64, dragged: u64) {
             wd.layout.pos_in_scrolling_layout,
         ) {
             if t_col != d_col {
-                snap_put(wt.id, SnapRecord::capture(wt, true), true);
-                snap_put(wd.id, SnapRecord::capture(wd, true), true);
+                snap_put_focus_keep_origin(wt);
+                snap_put_focus_keep_origin(wd);
                 move_column_to(dragged, t_col);
             }
             return;
@@ -422,11 +434,10 @@ fn tile_pair_in_new_workspace(target: u64, dragged: u64) {
             .workspace_id
             .and_then(|id| workspaces.iter().find(|ws| ws.id == id));
         if let Some(ws) = anchor_ws {
-            snap_put(anchor.id, SnapRecord::capture(anchor, true), true);
-            snap_put(mover.id, SnapRecord::capture(mover, true), true);
+            snap_put_focus_keep_origin(anchor);
+            snap_put_focus_keep_origin(mover);
 
             if mover.workspace_id != anchor.workspace_id {
-                snap_put(mover.id, SnapRecord::capture(mover, false), false);
                 send_action_checked(
                     "focus-workspace",
                     Action::FocusWorkspace {
@@ -530,12 +541,17 @@ fn restore_split(id: u64) {
 
     let mut focus_ws: Option<u64> = None;
     for w in windows.iter().filter(|w| w.workspace_id == Some(current_ws)) {
-        let Some(origin_ws) = snap_take_split(w.id).and_then(|r| r.origin_ws) else {
+        let Some(origin_ws) = snap_get(w.id)
+            .and_then(|r| r.origin_ws)
+            .filter(|o| *o != current_ws)
+        else {
             continue;
         };
         if !workspaces.iter().any(|ws| ws.id == origin_ws) {
             continue;
         }
+        snap_take(w.id);
+        FOCUS_SHARED.with(|f| f.borrow_mut().remove(&w.id));
         send_action(Action::MoveWindowToWorkspace {
             window_id: Some(w.id),
             reference: WorkspaceReferenceArg::Id(origin_ws),
@@ -1625,7 +1641,7 @@ fn snap_to_focus_mode(id: u64) {
 }
 
 fn focus_width_is_full(id: u64) -> Option<bool> {
-    if !snap_is_focus_mode(id) {
+    if snap_get(id).is_none() {
         return None;
     }
     let mut sock = Socket::connect().ok()?;
@@ -2520,6 +2536,16 @@ fn is_switch_modifier(key: gdk::Key) -> bool {
     )
 }
 
+fn detach_from_parent(w: &impl IsA<gtk4::Widget>) {
+    if let Some(parent) = w.parent() {
+        if let Ok(b) = parent.clone().downcast::<GtkBox>() {
+            b.remove(w);
+        } else {
+            w.unparent();
+        }
+    }
+}
+
 fn update_dockbox(
     dockbox: &GtkBox,
     tray_box: &GtkBox,
@@ -2547,6 +2573,8 @@ fn update_dockbox(
     }
 
     close_dock_menu();
+    detach_from_parent(tray_box);
+    detach_from_parent(tray_menu_layer);
     while let Some(child) = dockbox.first_child() {
         dockbox.remove(&child);
     }
