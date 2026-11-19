@@ -2507,11 +2507,33 @@ fn restore_dock_monitor(win: &ApplicationWindow) {
     }
 }
 
+fn switch_modifier_held() -> bool {
+    let Some(display) = gdk::Display::default() else { return true };
+    let Some(seat) = display.default_seat() else { return true };
+    let Some(kb) = seat.keyboard() else { return true };
+    kb.modifier_state().intersects(
+        gdk::ModifierType::ALT_MASK
+            | gdk::ModifierType::SUPER_MASK
+            | gdk::ModifierType::META_MASK
+            | gdk::ModifierType::CONTROL_MASK,
+    )
+}
+
 fn start_focus_watchdog(win: ApplicationWindow, finish: Rc<dyn Fn(bool)>) {
     let waited = Cell::new(0u32);
+    let active_ticks = Cell::new(0u32);
     glib::timeout_add_local(Duration::from_millis(40), move || {
-        if !switch_active() || win.is_active() {
+        if !switch_active() {
             return glib::ControlFlow::Break;
+        }
+        if win.is_active() {
+            let n = active_ticks.get() + 1;
+            active_ticks.set(n);
+            if n >= 3 && !switch_modifier_held() {
+                finish(true);
+                return glib::ControlFlow::Break;
+            }
+            return glib::ControlFlow::Continue;
         }
         waited.set(waited.get() + 1);
         if waited.get() > 50 {
@@ -2810,14 +2832,22 @@ pub fn spawn_altdock(app: &Application, dockbox: GtkBox) -> ApplicationWindow {
     }
     win.add_controller(hover_ctrl);
 
+    let dock_shown: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let switch_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+    const SHOW_DELAY_MS: u64 = 250; // tweak to taste
+
     let end_switch: Rc<dyn Fn(bool)> = {
         let win = win.clone();
         let dock_state = dock_state.clone();
         let hide_dock = hide_dock.clone();
+        let dock_shown = dock_shown.clone();
+        let switch_gen = switch_gen.clone();
         Rc::new(move |commit| {
             if !SWITCH_ACTIVE.with(|a| a.replace(false)) {
                 return;
             }
+            switch_gen.set(switch_gen.get().wrapping_add(1));
+
             let sel = SWITCH_SEL.with(|s| s.take());
             let orig = SWITCH_ORIG.with(|o| o.take());
             clear_switch_sel(&dock_state);
@@ -2835,7 +2865,9 @@ pub fn spawn_altdock(app: &Application, dockbox: GtkBox) -> ApplicationWindow {
                     }
                 }
             }
-            hide_dock(0);
+            if dock_shown.replace(false) {
+                hide_dock(0);
+            }
             let win = win.clone();
             glib::timeout_add_local_once(Duration::from_millis(700), move || {
                 restore_dock_monitor(&win);
@@ -2848,14 +2880,28 @@ pub fn spawn_altdock(app: &Application, dockbox: GtkBox) -> ApplicationWindow {
         let dock_state = dock_state.clone();
         let show_dock = show_dock.clone();
         let end_switch = end_switch.clone();
+        let dock_shown = dock_shown.clone();
+        let switch_gen = switch_gen.clone();
         Rc::new(move |step| {
             if !SWITCH_ACTIVE.with(|a| a.replace(true)) {
                 SWITCH_SEL.with(|s| s.set(None));
                 SWITCH_ORIG.with(|o| o.set(get_focused_window_id()));
                 move_dock_to_focused_output(&win);
                 win.set_keyboard_mode(KeyboardMode::Exclusive);
-                show_dock();
+                dock_shown.set(false);
                 start_focus_watchdog(win.clone(), end_switch.clone());
+
+                let session = switch_gen.get().wrapping_add(1);
+                switch_gen.set(session);
+                let show_dock = show_dock.clone();
+                let dock_shown = dock_shown.clone();
+                let switch_gen = switch_gen.clone();
+                glib::timeout_add_local_once(Duration::from_millis(SHOW_DELAY_MS), move || {
+                    if switch_active() && switch_gen.get() == session {
+                        dock_shown.set(true);
+                        show_dock();
+                    }
+                });
             }
             switcher_select(&dock_state, step);
             if SWITCH_SEL.with(|s| s.get()).is_none() {
